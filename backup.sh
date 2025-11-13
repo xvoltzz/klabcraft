@@ -1,45 +1,88 @@
 #!/bin/bash
+# Local, full-directory backup (no rsync): save-off -> flush -> copy -> save-on
 
-# === config ===
-MC_DIR="/home/klab/Servers/EvoMC"
-BACKUP_ROOT="/home/klab/Servers/Backups"
-SCREEN_NAME="minecraft"
+set -euo pipefail
 
-# === make sure backup root exists ===
+### === CONFIG ===
+MC_DIR="/home/klab/Servers/EvoMC"          # server folder (server.jar, world/, logs/, etc.)
+BACKUP_ROOT="/home/klab/Servers/Backups"   # where timestamped copies go
+SCREEN_NAME="minecraft"                    # GNU screen session name
+LOG_FILE="$MC_DIR/logs/latest.log"         # server log to watch for "Saved..."
+SAY_PREFIX="[KLABNET]"                     # chat prefix
+
+### === DEPS / GUARDS ===
+die(){ echo "error: $*" >&2; exit 1; }
+command -v screen >/dev/null || die "gnu screen not found"
+
+[ -d "$MC_DIR" ]   || die "MC_DIR not found: $MC_DIR"
+[ -f "$LOG_FILE" ] || die "LOG_FILE not found: $LOG_FILE"
+
+# ensure a screen session named exactly $SCREEN_NAME exists
+screen -ls | grep -q "[.]${SCREEN_NAME}[[:space:]]" || die "screen session '${SCREEN_NAME}' not running"
+
 mkdir -p "$BACKUP_ROOT"
 
-# === get latest version from server.log ===
-VERSION=$(grep -oP 'version \K[\d\.]+' "$MC_DIR/server.log" | tail -n1)
-[[ -z "$VERSION" ]] && VERSION="unknown"
+### === HELPERS ===
+mc_cmd(){ screen -S "$SCREEN_NAME" -p 0 -X stuff "$1$(printf '\r')"; }
 
-# === generate snapshot info ===
-DATE=$(date +'%Y-%m-%d')
-TIME=$(date +'%H:%M:%S')
-SNAPSHOT_NAME="EvoMC (Snapshot $DATE $VERSION)"
-BACKUP_DIR="$BACKUP_ROOT/$SNAPSHOT_NAME"
+# always try to re-enable saving on exit, even on failure
+restore_saving(){ mc_cmd "save-on" >/dev/null 2>&1 || true; }
+trap restore_saving EXIT
 
-# === notify players in server ===
-screen -S "$SCREEN_NAME" -p 0 -X stuff "say [KLABNET] Taking Server Snapshot - $VERSION $DATE $TIME\n"
+### === ANNOUNCE + QUIESCE ===
+mc_cmd "say ${SAY_PREFIX} world backup starting — pausing autosave…"
+mc_cmd "save-off"
+sleep 1
+mc_cmd "say ${SAY_PREFIX} flushing chunks to disk…"
+mc_cmd "save-all"
 
-# === pause world saving safely ===
-screen -S "$SCREEN_NAME" -p 0 -X stuff "save-off\n"
-screen -S "$SCREEN_NAME" -p 0 -X stuff "save-all\n"
-sleep 5
+# unique marker so we only trust 'Saved' lines after this exact point
+MARK="evbot-save-$(date +%s)"
+printf "%s\n" "$MARK" >> "$LOG_FILE"
 
-# === create snapshot folder & back up server ===
+# wait up to 60s for 'Saved' after the marker (vanilla/paper log lines contain 'Saved')
+if ! timeout 60 bash -c \
+  "awk -v mark='$MARK' '
+     \$0 ~ mark { seen=1; next }
+     seen && /Saved/ { exit 0 }
+   END { exit 1 }' <(tail -n 0 -F \"$LOG_FILE\")" ; then
+  echo "warn: timed out waiting for save confirmation — proceeding anyway"
+fi
+
+### === COPY THE ENTIRE SERVER DIRECTORY (LOCAL ONLY) ===
+TS="$(date '+%Y-%m-%d_%H-%M-%S')"
+BACKUP_DIR="${BACKUP_ROOT}/${TS}"
 mkdir -p "$BACKUP_DIR"
-rsync -a --delete "$MC_DIR/" "$BACKUP_DIR/"
 
-# === resume world saving ===
-screen -S "$SCREEN_NAME" -p 0 -X stuff "save-on\n"
+mc_cmd "say ${SAY_PREFIX} copying server directory to backups (${TS})…"
 
-# === save snapshot metadata inside backup ===
+# two safe paths:
+# 1) normal: BACKUP_ROOT is outside MC_DIR -> simple cp -a (includes dotfiles using /.)
+# 2) edge:   BACKUP_ROOT inside MC_DIR -> tar pipe excluding BACKUP_ROOT to avoid recursion
+if [[ "$BACKUP_ROOT" == "$MC_DIR"* ]]; then
+  # compute path relative to MC_DIR to exclude from copy
+  rel_exclude="${BACKUP_ROOT#${MC_DIR}/}"
+  echo "warn: BACKUP_ROOT is inside MC_DIR — excluding '$rel_exclude' during copy"
+  (
+    cd "$MC_DIR"
+    # exclude the backups dir; copy everything else via local tar pipe
+    tar --exclude="./${rel_exclude}" -cf - . | (cd "$BACKUP_DIR" && tar -xf -)
+  )
+else
+  # plain local copy, preserving attrs; /.` ensures dotfiles are included
+  cp -a "$MC_DIR"/. "$BACKUP_DIR"/
+fi
+
+# tiny manifest
 {
-  echo "Version: $VERSION"
-  echo "Date: $DATE"
-  echo "Time: $TIME"
-} > "$BACKUP_DIR/version.txt"
+  echo "source: $MC_DIR"
+  echo "backup_dir: $BACKUP_DIR"
+  echo "timestamp: $TS"
+  echo "log_marker: $MARK"
+} > "$BACKUP_DIR/.backup-manifest.txt"
 
-# === done! notify server ===
-screen -S "$SCREEN_NAME" -p 0 -X stuff "say [KLABNET] Snapshot Complete ✅\n"
-
+### === DONE ===
+mc_cmd "say ${SAY_PREFIX} server backup complete → ${TS}"
+mc_cmd "save-on"
+trap - EXIT
+echo "done: $BACKUP_DIR"
